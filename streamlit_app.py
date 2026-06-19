@@ -34,8 +34,11 @@ BORDER = (228, 231, 235)   # #E4E7EB
 LOGO_PATH = "assets_logo.png" if os.path.exists("assets_logo.png") else "Logo1.png"
 SIGNATURE_PATH = "Signature.png"
 TX_FILE = "transactions.csv"
-TX_COLS = ["date", "doc_no", "received_from", "payment_for",
+TX_COLS = ["date", "doc_no", "invoice_no", "received_from", "payment_for",
            "mode", "reference", "amount", "currency"]
+INV_FILE = "invoices.csv"
+INV_COLS = ["date", "invoice_no", "bill_to", "currency",
+            "subtotal", "tax", "total", "notes"]
 
 CURRENCIES = ["GHS", "USD", "EUR", "GBP", "NGN"]
 PAYMENT_MODES = [
@@ -128,8 +131,8 @@ def compute_totals(df: pd.DataFrame, tax_rate: float, discount: float):
 # Backend: Google Sheets when configured via st.secrets, else local CSV.
 # --------------------------------------------------------------------------- #
 @st.cache_resource(show_spinner=False)
-def _gs_worksheet():
-    """Return the 'transactions' worksheet, or None if Sheets isn't set up."""
+def _gs_sheet(title: str, header: tuple):
+    """Return worksheet `title` (creating it with `header`), or None."""
     try:
         import gspread
         from google.oauth2.service_account import Credentials
@@ -151,12 +154,11 @@ def _gs_worksheet():
         sh = client.open_by_url(ref) if str(ref).startswith("http") \
             else client.open_by_key(ref)
         try:
-            ws = sh.worksheet("transactions")
+            ws = sh.worksheet(title)
         except Exception:
-            ws = sh.add_worksheet("transactions", rows=2000, cols=len(TX_COLS))
-        if ws.row_values(1) != TX_COLS:
-            if not ws.row_values(1):
-                ws.append_row(TX_COLS)
+            ws = sh.add_worksheet(title, rows=2000, cols=len(header))
+        if not ws.row_values(1):
+            ws.append_row(list(header))
         return ws
     except Exception as exc:  # bad creds / not shared / API off
         st.session_state["_gs_error"] = str(exc)
@@ -164,7 +166,7 @@ def _gs_worksheet():
 
 
 def using_gsheets() -> bool:
-    return _gs_worksheet() is not None
+    return _gs_sheet("transactions", tuple(TX_COLS)) is not None
 
 
 def backend_label() -> str:
@@ -172,48 +174,97 @@ def backend_label() -> str:
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def _read_gsheet():
-    ws = _gs_worksheet()
+def _read_gsheet(title: str, header: tuple):
+    ws = _gs_sheet(title, header)
     if ws is None:
         return None
-    return ws.get_all_records(expected_headers=TX_COLS)
+    return ws.get_all_records(expected_headers=list(header))
 
 
-def load_transactions() -> pd.DataFrame:
-    records = _read_gsheet()
+def _read_csv_text(file: str) -> pd.DataFrame:
+    # read everything as text so ids like "005" keep leading zeros
+    return pd.read_csv(file, dtype=str, keep_default_na=False)
+
+
+def _load_ledger(file: str, title: str, cols: list) -> pd.DataFrame:
+    records = _read_gsheet(title, tuple(cols))
     if records is not None:
-        df = pd.DataFrame(records)
-        for c in TX_COLS:
-            if c not in df.columns:
-                df[c] = None
-        return df[TX_COLS] if not df.empty else pd.DataFrame(columns=TX_COLS)
-    if os.path.exists(TX_FILE):
+        df = pd.DataFrame(records).astype(str)
+    elif os.path.exists(file):
         try:
-            df = pd.read_csv(TX_FILE)
+            df = _read_csv_text(file)
         except Exception:
-            return pd.DataFrame(columns=TX_COLS)
-        for c in TX_COLS:
-            if c not in df.columns:
-                df[c] = None
-        return df[TX_COLS]
-    return pd.DataFrame(columns=TX_COLS)
+            return pd.DataFrame(columns=cols)
+    else:
+        return pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols] if not df.empty else pd.DataFrame(columns=cols)
 
 
-def record_transaction(row: dict) -> None:
-    ws = _gs_worksheet()
+def _append_ledger(file: str, title: str, cols: list, row: dict) -> None:
+    ws = _gs_sheet(title, tuple(cols))
     if ws is not None:
-        ws.append_row([row.get(c, "") for c in TX_COLS],
-                      value_input_option="USER_ENTERED")
+        # RAW so document numbers (e.g. "005") aren't parsed into integers
+        ws.append_row([str(row.get(c, "")) for c in cols],
+                      value_input_option="RAW")
         _read_gsheet.clear()
         return
-    df = pd.DataFrame(columns=TX_COLS)
-    if os.path.exists(TX_FILE):
+    df = pd.DataFrame(columns=cols)
+    if os.path.exists(file):
         try:
-            df = pd.read_csv(TX_FILE)
+            df = _read_csv_text(file)
         except Exception:
             pass
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df.to_csv(TX_FILE, index=False)
+    df.to_csv(file, index=False)
+
+
+def _norm_no(x) -> str:
+    """Normalise a document number for matching ('5.0' -> '5', strips spaces)."""
+    s = str(x).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def load_transactions() -> pd.DataFrame:
+    return _load_ledger(TX_FILE, "transactions", TX_COLS)
+
+
+def record_transaction(row: dict) -> None:
+    _append_ledger(TX_FILE, "transactions", TX_COLS, row)
+
+
+def load_invoices() -> pd.DataFrame:
+    return _load_ledger(INV_FILE, "invoices", INV_COLS)
+
+
+def record_invoice(row: dict) -> None:
+    _append_ledger(INV_FILE, "invoices", INV_COLS, row)
+
+
+def paid_by_invoice(txns: pd.DataFrame) -> dict:
+    """Map invoice_no -> total amount received against it."""
+    if txns.empty:
+        return {}
+    t = txns.copy()
+    t["amount"] = pd.to_numeric(t["amount"], errors="coerce").fillna(0)
+    t["invoice_no"] = t["invoice_no"].map(_norm_no)
+    t = t[t["invoice_no"].ne("") & t["invoice_no"].ne("nan")]
+    return t.groupby("invoice_no")["amount"].sum().to_dict()
+
+
+def next_invoice_no() -> str:
+    """Suggest the next invoice number from history (continues from 005)."""
+    inv = load_invoices()
+    nums = []
+    for v in inv["invoice_no"].dropna().astype(str):
+        m = re.search(r"(\d+)", v)
+        if m:
+            nums.append(int(m.group(1)))
+    return f"{(max(nums) + 1) if nums else 5:03d}"
 
 
 # --------------------------------------------------------------------------- #
@@ -776,9 +827,10 @@ def render_receipt_preview(*, receipt_no, receipt_date, received_from,
 # Views
 # --------------------------------------------------------------------------- #
 def invoice_view():
+    existing_inv = load_invoices()
     with st.sidebar:
         st.header("Invoice details")
-        invoice_no = st.text_input("Invoice number", value="005")
+        invoice_no = st.text_input("Invoice number", value=next_invoice_no())
         invoice_date = st.date_input("Invoice date", value=date(2026, 6, 19),
                                      key="inv_date")
         date_str = invoice_date.strftime("%B %d, %Y")
@@ -835,6 +887,24 @@ def invoice_view():
                 "Download invoice PDF", data=pdf_bytes,
                 file_name=f"{_slug(bill_to_name)}-Invoice-{invoice_no}.pdf",
                 mime="application/pdf", use_container_width=True)
+
+            already = invoice_no in existing_inv["invoice_no"].astype(str).values
+            st.caption("Saving keeps this invoice in your history so receipts "
+                       "can be applied against it.")
+            if already:
+                st.success(f"Invoice {invoice_no} is already saved.")
+            elif st.button("Save invoice to history", type="primary",
+                           use_container_width=True):
+                if not bill_to_name.strip():
+                    st.warning("Add a client name before saving.")
+                else:
+                    record_invoice({
+                        "date": invoice_date.isoformat(), "invoice_no": invoice_no,
+                        "bill_to": bill_to_name, "currency": symbol,
+                        "subtotal": round(subtotal, 2), "tax": round(tax, 2),
+                        "total": round(total, 2), "notes": notes})
+                    st.success(f"Saved invoice {invoice_no} → {backend_label()}.")
+                    st.rerun()
         else:
             st.info("Add at least one line item to enable the PDF download.")
 
@@ -852,24 +922,54 @@ def invoice_view():
 
 def receipt_view():
     txns = load_transactions()
+    invoices = load_invoices()
+    paid_map = paid_by_invoice(txns)
     next_no = f"RCP-{len(txns) + 1:03d}"
+
+    # build invoice link options (unpaid/partial balances first)
+    link_options = ["— None (standalone receipt) —"]
+    link_lookup = {}
+    for _, r in invoices.iterrows():
+        inv_no = _norm_no(r["invoice_no"])
+        ccy = str(r["currency"]) if str(r["currency"]) in CURRENCIES else "GHS"
+        total = float(pd.to_numeric(pd.Series([r["total"]]),
+                                    errors="coerce").fillna(0).iloc[0])
+        bal = round(total - paid_map.get(inv_no, 0.0), 2)
+        label = f"{inv_no} · {r['bill_to']} · balance {money(bal, ccy)}"
+        link_options.append(label)
+        link_lookup[label] = {"invoice_no": inv_no, "bill_to": str(r["bill_to"]),
+                              "balance": max(bal, 0.0), "currency": ccy}
 
     with st.sidebar:
         st.header("Receipt details")
+        sel = st.selectbox("Apply to invoice", link_options)
+        link = link_lookup.get(sel)
+        kb = link["invoice_no"] if link else "free"  # widget keys reset on change
+
         receipt_no = st.text_input("Receipt number", value=next_no)
         receipt_date = st.date_input("Payment date", value=date.today(),
                                      key="rcp_date")
         date_str = receipt_date.strftime("%B %d, %Y")
-        received_from = st.text_input("Received from",
-                                      value="Lawra Municipal Assembly")
-        amount = st.number_input("Amount received", min_value=0.0, value=0.0,
-                                 step=50.0, format="%.2f")
-        symbol = st.selectbox("Currency", CURRENCIES, index=0, key="rcp_ccy")
+        received_from = st.text_input(
+            "Received from",
+            value=(link["bill_to"] if link else "Lawra Municipal Assembly"),
+            key=f"rf_{kb}")
+        amount = st.number_input(
+            "Amount received", min_value=0.0,
+            value=float(link["balance"]) if link else 0.0,
+            step=50.0, format="%.2f", key=f"amt_{kb}")
+        ccy_default = link["currency"] if link else "GHS"
+        symbol = st.selectbox("Currency", CURRENCIES,
+                              index=CURRENCIES.index(ccy_default),
+                              key=f"cc_{kb}")
         mode = st.selectbox("Mode of payment", PAYMENT_MODES, index=0)
-        payment_for = st.text_input("Being payment for",
-                                    placeholder="e.g. Invoice #005 — supplies")
+        payment_for = st.text_input(
+            "Being payment for",
+            value=(f"Invoice {link['invoice_no']}" if link else ""),
+            placeholder="e.g. Invoice 005 — supplies", key=f"pf_{kb}")
         reference = st.text_input("Reference / Txn ID",
                                   placeholder="cheque no, MoMo ref, etc.")
+    link_no = link["invoice_no"] if link else ""
 
     words = amount_to_words(
         amount, currency_name=("Ghana Cedis" if symbol == "GHS" else symbol),
@@ -888,16 +988,22 @@ def receipt_view():
             st.download_button("Download receipt PDF", data=pdf_bytes,
                                file_name=f"Apple-Reigns-Receipt-{receipt_no}.pdf",
                                mime="application/pdf", use_container_width=True)
-            st.caption("Logging adds this payment to your revenue analytics.")
+            if link_no:
+                st.caption(f"Will be applied to **invoice {link_no}** and added "
+                           "to your analytics & history.")
+            else:
+                st.caption("Logging adds this payment to your analytics & history.")
             if st.button("Record this payment", type="primary",
                          use_container_width=True):
                 record_transaction({
                     "date": receipt_date.isoformat(), "doc_no": receipt_no,
-                    "received_from": received_from, "payment_for": payment_for,
-                    "mode": mode, "reference": reference, "amount": amount,
-                    "currency": symbol})
+                    "invoice_no": link_no, "received_from": received_from,
+                    "payment_for": payment_for, "mode": mode,
+                    "reference": reference, "amount": amount, "currency": symbol})
+                tail = f" (invoice {link_no})" if link_no else ""
                 st.success(f"Recorded {money(amount, symbol)} from "
-                           f"{received_from} → {backend_label()}.")
+                           f"{received_from}{tail} → {backend_label()}.")
+                st.rerun()
         else:
             st.info("Enter a payer and an amount above to enable the receipt.")
 
@@ -913,43 +1019,73 @@ def receipt_view():
 
 
 def analytics_view():
-    st.subheader("Revenue analytics")
+    st.subheader("Analytics & history")
     st.caption(f"Ledger storage: **{backend_label()}**.")
+
     df = load_transactions()
-    if df.empty:
-        st.info("No payments recorded yet. Record payments from the **Receipt** "
-                "tab (or log one below) to start tracking revenue inflows.")
-    else:
+    invoices = load_invoices()
+    paid_map = paid_by_invoice(df)
+
+    has_pay = not df.empty
+    if has_pay:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
         df = df.dropna(subset=["date"])
-        symbol = df["currency"].mode().iat[0] if not df["currency"].isna().all() else "GHS"
+    symbol = "GHS"
+    if has_pay and not df["currency"].isna().all():
+        symbol = df["currency"].mode().iat[0]
+    elif not invoices.empty and not invoices["currency"].isna().all():
+        symbol = invoices["currency"].mode().iat[0]
 
-        today = pd.Timestamp(date.today())
-        last7 = df[df["date"] >= today - pd.Timedelta(days=6)]
-        last30 = df[df["date"] >= today - pd.Timedelta(days=29)]
+    # ---- invoice status table (computed live from receipts) -------------- #
+    inv_disp = pd.DataFrame()
+    total_invoiced = total_outstanding = 0.0
+    if not invoices.empty:
+        inv = invoices.copy()
+        inv["total"] = pd.to_numeric(inv["total"], errors="coerce").fillna(0)
+        inv["invoice_no"] = inv["invoice_no"].map(_norm_no)
+        inv["Paid"] = inv["invoice_no"].map(lambda n: paid_map.get(n, 0.0))
+        inv["Balance"] = (inv["total"] - inv["Paid"]).round(2)
+        inv["Status"] = inv.apply(
+            lambda r: "Paid" if r["Paid"] >= r["total"] and r["total"] > 0
+            else ("Partial" if r["Paid"] > 0 else "Unpaid"), axis=1)
+        total_invoiced = float(inv["total"].sum())
+        total_outstanding = float(inv["Balance"].clip(lower=0).sum())
+        inv_disp = inv
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Last 7 days", money(last7["amount"].sum(), symbol),
-                  f"{len(last7)} payments")
-        m2.metric("Last 30 days", money(last30["amount"].sum(), symbol),
-                  f"{len(last30)} payments")
-        m3.metric("All-time revenue", money(df["amount"].sum(), symbol),
-                  f"{len(df)} payments")
-        avg = df["amount"].mean() if len(df) else 0
-        m4.metric("Average payment", money(avg, symbol))
+    collected = float(df["amount"].sum()) if has_pay else 0.0
+    today = pd.Timestamp(date.today())
+    last7 = df[df["date"] >= today - pd.Timedelta(days=6)] if has_pay else df
+    last30 = df[df["date"] >= today - pd.Timedelta(days=29)] if has_pay else df
 
+    # ---- headline metrics ------------------------------------------------- #
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Collected (7 days)", money(last7["amount"].sum() if has_pay else 0, symbol),
+              f"{len(last7) if has_pay else 0} payments")
+    m2.metric("Collected (30 days)", money(last30["amount"].sum() if has_pay else 0, symbol),
+              f"{len(last30) if has_pay else 0} payments")
+    m3.metric("Total collected", money(collected, symbol),
+              f"{len(df) if has_pay else 0} payments")
+    m4.metric("Outstanding", money(total_outstanding, symbol),
+              f"of {money(total_invoiced, symbol)} invoiced")
+
+    if not (has_pay or not invoices.empty):
+        st.info("Nothing recorded yet. Save invoices from the **Invoice** tab and "
+                "record payments from the **Receipt** tab to build your history.")
+
+    # ---- charts ----------------------------------------------------------- #
+    if has_pay:
         st.divider()
         ca, cb = st.columns(2)
         with ca:
-            st.markdown("**Daily revenue — last 30 days**")
+            st.markdown("**Daily collections — last 30 days**")
             idx = pd.date_range(today - pd.Timedelta(days=29), today)
             daily = (last30.groupby(last30["date"].dt.normalize())["amount"]
                      .sum().reindex(idx, fill_value=0))
             daily.index = daily.index.strftime("%b %d")
             st.bar_chart(daily, color=(5, 150, 105), height=260)
         with cb:
-            st.markdown("**Revenue by payment mode — last 30 days**")
+            st.markdown("**Collections by payment mode — last 30 days**")
             by_mode = (last30.groupby("mode")["amount"].sum()
                        .sort_values(ascending=False))
             if by_mode.empty:
@@ -957,21 +1093,46 @@ def analytics_view():
             else:
                 st.bar_chart(by_mode, color=(30, 58, 95), height=260)
 
-        st.markdown("**Recent payments**")
-        recent = df.sort_values("date", ascending=False).head(25).copy()
+    # ---- invoice history -------------------------------------------------- #
+    if not inv_disp.empty:
+        st.divider()
+        st.markdown("**Invoice history**")
+        show = inv_disp.sort_values("date", ascending=False).copy()
+        show = show.rename(columns={
+            "date": "Date", "invoice_no": "Invoice", "bill_to": "Client",
+            "total": "Total", "currency": "Ccy"})
+        st.dataframe(
+            show[["Date", "Invoice", "Client", "Total", "Paid", "Balance",
+                  "Status", "Ccy"]],
+            use_container_width=True, hide_index=True)
+        st.download_button("Download invoices (CSV)",
+                           data=invoices.to_csv(index=False).encode(),
+                           file_name="apple-reigns-invoices.csv",
+                           mime="text/csv", key="dl_inv")
+
+    # ---- receipt / payment history --------------------------------------- #
+    if has_pay:
+        st.markdown("**Payment history**")
+        recent = df.sort_values("date", ascending=False).copy()
         recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
         recent = recent.rename(columns={
-            "date": "Date", "doc_no": "Receipt", "received_from": "From",
-            "payment_for": "For", "mode": "Mode", "reference": "Ref",
-            "amount": "Amount", "currency": "Ccy"})
-        st.dataframe(recent, use_container_width=True, hide_index=True)
-        st.download_button("Download ledger (CSV)",
+            "date": "Date", "doc_no": "Receipt", "invoice_no": "Invoice",
+            "received_from": "From", "payment_for": "For", "mode": "Mode",
+            "reference": "Ref", "amount": "Amount", "currency": "Ccy"})
+        st.dataframe(
+            recent[["Date", "Receipt", "Invoice", "From", "Amount", "Mode",
+                    "For", "Ref", "Ccy"]],
+            use_container_width=True, hide_index=True)
+        st.download_button("Download payments (CSV)",
                            data=df.to_csv(index=False).encode(),
-                           file_name="apple-reigns-transactions.csv",
-                           mime="text/csv")
+                           file_name="apple-reigns-payments.csv",
+                           mime="text/csv", key="dl_pay")
 
     # manual entry — for payments received without a generated receipt
     with st.expander("➕ Log a payment manually"):
+        inv_choices = ["—"] + (
+            invoices["invoice_no"].astype(str).tolist()
+            if not invoices.empty else [])
         with st.form("manual_tx", clear_on_submit=True):
             c1, c2, c3 = st.columns(3)
             d = c1.date_input("Date", value=date.today(), key="man_date")
@@ -980,12 +1141,15 @@ def analytics_view():
             c4, c5, c6 = st.columns(3)
             ccy = c4.selectbox("Currency", CURRENCIES, index=0, key="man_ccy")
             md = c5.selectbox("Mode", PAYMENT_MODES, index=0, key="man_mode")
-            ref = c6.text_input("Reference")
-            what = st.text_input("Payment for")
+            link_inv = c6.selectbox("Apply to invoice", inv_choices, key="man_inv")
+            ca, cb = st.columns(2)
+            ref = ca.text_input("Reference")
+            what = cb.text_input("Payment for")
             if st.form_submit_button("Add to ledger", type="primary"):
                 if amt > 0 and who.strip():
                     record_transaction({
                         "date": d.isoformat(), "doc_no": "manual",
+                        "invoice_no": "" if link_inv == "—" else link_inv,
                         "received_from": who, "payment_for": what, "mode": md,
                         "reference": ref, "amount": amt, "currency": ccy})
                     st.success(f"Logged {money(amt, ccy)} from {who}.")
@@ -1036,7 +1200,7 @@ def main():
         unsafe_allow_html=True)
 
     mode = st.sidebar.radio(
-        "Generate", ["🧾 Invoice", "🧾 Payment receipt", "📈 Revenue analytics"],
+        "Generate", ["🧾 Invoice", "🧾 Payment receipt", "📈 Analytics & history"],
         index=0)
     st.sidebar.divider()
 
