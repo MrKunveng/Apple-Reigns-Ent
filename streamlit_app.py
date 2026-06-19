@@ -847,7 +847,7 @@ def invoice_view():
         st.subheader("Footer")
         payment_terms = st.text_area(
             "Payment terms",
-            value="Payment due within 30 days. Bank/MoMo details above.",
+            value="Payment due within 24 hours. Bank/MoMo details above.",
             height=80)
         notes = st.text_area("Notes", value="", height=70)
 
@@ -883,26 +883,38 @@ def invoice_view():
                 symbol=symbol, subtotal=subtotal, tax=tax, tax_rate=tax_rate,
                 discount=discount, total=total, notes=notes,
                 payment_terms=payment_terms)
-            st.download_button(
+            dl = st.download_button(
                 "Download invoice PDF", data=pdf_bytes,
                 file_name=f"{_slug(bill_to_name)}-Invoice-{invoice_no}.pdf",
                 mime="application/pdf", use_container_width=True)
 
-            already = invoice_no in existing_inv["invoice_no"].astype(str).values
-            st.caption("Saving keeps this invoice in your history so receipts "
-                       "can be applied against it.")
-            if already:
-                st.success(f"Invoice {invoice_no} is already saved.")
-            elif st.button("Save invoice to history", type="primary",
-                           use_container_width=True):
-                if not bill_to_name.strip():
-                    st.warning("Add a client name before saving.")
-                else:
-                    record_invoice({
-                        "date": invoice_date.isoformat(), "invoice_no": invoice_no,
-                        "bill_to": bill_to_name, "currency": symbol,
-                        "subtotal": round(subtotal, 2), "tax": round(tax, 2),
-                        "total": round(total, 2), "notes": notes})
+            saved_nos = set(existing_inv["invoice_no"].map(_norm_no))
+            already = _norm_no(invoice_no) in saved_nos
+
+            def _save_invoice():
+                record_invoice({
+                    "date": invoice_date.isoformat(), "invoice_no": invoice_no,
+                    "bill_to": bill_to_name, "currency": symbol,
+                    "subtotal": round(subtotal, 2), "tax": round(tax, 2),
+                    "total": round(total, 2), "notes": notes})
+
+            if not bill_to_name.strip():
+                st.caption("Add a client name so the invoice can be saved and "
+                           "linked to a receipt.")
+            elif already:
+                st.success(f"Invoice {invoice_no} is saved — select it on the "
+                           "**Payment receipt** tab to link a payment.")
+            elif dl:
+                # issuing (downloading) auto-saves so it's findable for receipts
+                _save_invoice()
+                st.success(f"Invoice {invoice_no} issued & saved to history "
+                           f"({backend_label()}). It's now selectable for receipts.")
+            else:
+                st.caption("Downloading also saves this invoice to history so a "
+                           "receipt can be linked to it.")
+                if st.button("Save invoice to history", type="primary",
+                             use_container_width=True):
+                    _save_invoice()
                     st.success(f"Saved invoice {invoice_no} → {backend_label()}.")
                     st.rerun()
         else:
