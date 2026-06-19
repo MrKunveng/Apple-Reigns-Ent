@@ -13,6 +13,7 @@ import base64
 import os
 import re
 from datetime import date, datetime, timedelta
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
@@ -261,16 +262,49 @@ def _draw_header(pdf: FPDF, title: str, meta: list[tuple[str, str]]) -> float:
     return band_h
 
 
+def _secret_get(section: str, key: str, default=None):
+    """Read st.secrets[section][key] without crashing when no secrets exist."""
+    try:
+        if section in st.secrets and key in st.secrets[section]:
+            return st.secrets[section][key]
+    except Exception:
+        pass
+    return default
+
+
+def signature_b64() -> str:
+    """Signature image as base64 — from secrets first, else the local file."""
+    data = _secret_get("signature", "data")
+    if data:
+        return str(data).strip()
+    if os.path.exists(SIGNATURE_PATH):
+        with open(SIGNATURE_PATH, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    return ""
+
+
+def signature_bytes():
+    b64 = signature_b64()
+    if not b64:
+        return None
+    try:
+        return base64.b64decode(b64)
+    except Exception:
+        return None
+
+
 def _draw_signature(pdf: FPDF, right: float = 195) -> None:
     """Signature image + line + caption, right-aligned at the current y."""
     sig_w = 70
     sig_x = right - sig_w
     y = pdf.get_y()
-    try:
-        img_w = 42
-        pdf.image(SIGNATURE_PATH, x=sig_x + (sig_w - img_w) / 2, y=y, w=img_w)
-    except Exception:
-        pass
+    sig = signature_bytes()
+    if sig:
+        try:
+            img_w = 42
+            pdf.image(BytesIO(sig), x=sig_x + (sig_w - img_w) / 2, y=y, w=img_w)
+        except Exception:
+            pass
     pdf.set_y(y + 18)
     pdf.set_draw_color(*MUTED)
     pdf.set_line_width(0.3)
@@ -993,9 +1027,8 @@ def main():
     if "logo_b64" not in st.session_state:
         with open(LOGO_PATH, "rb") as f:
             st.session_state["logo_b64"] = base64.b64encode(f.read()).decode()
-    if "sig_b64" not in st.session_state and os.path.exists(SIGNATURE_PATH):
-        with open(SIGNATURE_PATH, "rb") as f:
-            st.session_state["sig_b64"] = base64.b64encode(f.read()).decode()
+    if "sig_b64" not in st.session_state:
+        st.session_state["sig_b64"] = signature_b64()
 
     st.markdown(
         "<h1 style='margin-bottom:0'>Apple Reigns Enterprise</h1>"
